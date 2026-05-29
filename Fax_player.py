@@ -13,8 +13,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 class FaxPlayerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Panasonic 電話/FAX 再生・高精度2名対話文字起こし")
-        self.root.geometry("1150x720") # 全文表示エリア確保のため高さを少し広げました
+        self.root.title("Panasonic 電話/FAX 再生・高精度対話文字起こし")
+        self.root.geometry("1150x760")
         
         self.selected_dir = tk.StringVar()
         self.current_process = None
@@ -25,7 +25,9 @@ class FaxPlayerApp:
         self.timer_thread = None
         
         self.whisper_model = None
-        self.default_init_dir = os.path.join(os.path.expanduser("~"), "Documents")
+        
+        # 💡 Macの日本語環境で確実に「書類」フォルダを開くパス設定に修正
+        self.default_init_dir = os.path.expanduser("~/Documents")
         
         self.create_widgets()
 
@@ -46,7 +48,7 @@ class FaxPlayerApp:
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings")
         self.tree.heading("filename", text="音声ファイル名 (.WAV)")
         self.tree.heading("duration", text="長さ")
-        self.tree.heading("transcription", text="【電話・2名対話特化】文字起こし結果 (一行プレビュー)")
+        self.tree.heading("transcription", text="【複数話者タイムライン】文字起こし結果 (一行プレビュー)")
         self.tree.heading("folder", text="場所 (フォルダ)")
         self.tree.heading("date_info", text="関連情報 / 更新日時")
         
@@ -62,15 +64,15 @@ class FaxPlayerApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # ダブルクリックで再生、シングルクリックで全文表示
         self.tree.bind("<Double-1>", lambda event: self.play_audio())
         self.tree.bind("<<TreeviewSelect>>", lambda event: self.show_full_transcription())
+        self.tree.bind("<Alt-1>", lambda event: self.delete_single_transcription())
 
-        # 3. 【新機能】文字起こし全文表示エリア
-        detail_frame = ttk.LabelFrame(self.root, text=" 📝 選択中の文字起こし全文（クリックで表示）", padding=5)
+        # 3. 文字起こし全文表示エリア
+        detail_frame = ttk.LabelFrame(self.root, text=" 📝 選択中の文字起こし対話全文（時間・話者ごとのタイムライン表示）", padding=5)
         detail_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.detail_text = tk.Text(detail_frame, height=5, state=tk.DISABLED, bg="#FFFFFF", fg="#000000", font=("Helvetica", 12), wrap=tk.WORD)
+        self.detail_text = tk.Text(detail_frame, height=7, state=tk.DISABLED, bg="#FFFFFF", fg="#000000", font=("Menlo", 12), wrap=tk.WORD)
         self.detail_text.pack(fill=tk.X, side=tk.LEFT, expand=True)
         
         detail_scroll = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
@@ -105,6 +107,7 @@ class FaxPlayerApp:
         
         ttk.Button(control_frame, text="▶︎ 再生", command=self.play_audio).pack(side=tk.LEFT, padx=10)
         ttk.Button(control_frame, text="◼︎ 停止", command=self.stop_audio).pack(side=tk.LEFT, padx=10)
+        ttk.Button(control_frame, text="🗑️ 全文字起こし削除", command=self.delete_all_transcriptions).pack(side=tk.LEFT, padx=20)
         
         self.status_label = ttk.Label(control_frame, text="SDカードのフォルダを選択してください。")
         self.status_label.pack(side=tk.RIGHT, padx=10)
@@ -126,17 +129,22 @@ class FaxPlayerApp:
         folder = filedialog.askdirectory(title="PanasonicのSDカードを選択", initialdir=self.default_init_dir)
         if folder:
             self.selected_dir.set(folder)
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            self.stop_audio()
-            self.clear_log()
-            
-            # 全文表示エリアもクリア
-            self.detail_text.config(state=tk.NORMAL)
-            self.detail_text.delete("1.0", tk.END)
-            self.detail_text.config(state=tk.DISABLED)
-            
-            threading.Thread(target=self.load_files_recursive, args=(folder,), daemon=True).start()
+            self.refresh_list()
+
+    def refresh_list(self):
+        folder = self.selected_dir.get()
+        if not folder: return
+        
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.stop_audio()
+        self.clear_log()
+        
+        self.detail_text.config(state=tk.NORMAL)
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.config(state=tk.DISABLED)
+        
+        threading.Thread(target=self.load_files_recursive, args=(folder,), daemon=True).start()
 
     def get_audio_info(self, file_path):
         try:
@@ -205,15 +213,10 @@ class FaxPlayerApp:
         self.root.after(0, lambda: self.log(f"計 {total_files} 個のWAVファイルを検出"))
         
         for data in all_wav_data:
-            # 各ファイルの保存済みテキストのパスを生成
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + ".transcription.txt")
             initial_status = "📄 保存済みデータを読込中..." if os.path.exists(txt_save_path) else "📄 AI解析待ち..."
-            
-            self.root.after(0, lambda d=data, status=initial_status: self.tree.insert(
-                "", tk.END, values=(d["wav"], d["duration"], status, d["rel_folder"], d["info_text"]), tags=(d["full_path"],)
-            ))
+            self.tree.insert("", tk.END, values=(data["wav"], data["duration"], initial_status, data["rel_folder"], data["info_text"]), tags=(data["full_path"],))
 
-        # Whisperモデルの遅延ロード判定
         need_ai = any(not os.path.exists(os.path.join(d["dirpath"], d["base_name"] + ".transcription.txt")) for d in all_wav_data if d["seconds"] > 0.5)
         
         if need_ai:
@@ -234,27 +237,51 @@ class FaxPlayerApp:
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + ".transcription.txt")
             text_result = ""
             
-            # 【新機能】すでに文字起こしファイルが存在する場合は読み込んでスキップ
             if os.path.exists(txt_save_path):
-                self.root.after(0, lambda name=data['wav']: self.log(f"⚡️ 保存済みファイルを再利用 (AIスキップ): {name}"))
                 try:
                     with open(txt_save_path, 'r', encoding='utf-8') as f:
                         text_result = f.read().strip()
-                except Exception as e:
-                    self.root.after(0, lambda name=data['wav']: self.log(f"⚠️ 保存済みファイルの読込失敗、再解析します: {name}"))
+                except:
+                    pass
             
-            # 保存データがない場合のみAIを実行
             if not text_result and data["seconds"] > 0.5 and self.whisper_model:
-                self.root.after(0, lambda idx=index: self.log(f"[{idx + 1}/{total_files}] 新規AI文字起こし中: {data['wav']}"))
+                self.root.after(0, lambda idx=index: self.log(f"[{idx + 1}/{total_files}] 新規AI文字起こし＆話者分離中: {data['wav']}"))
                 optimized_wav = self.preprocess_phone_audio_via_ffmpeg(data["full_path"])
                 try:
                     result = self.whisper_model.transcribe(
                         optimized_wav, language="ja", fp16=False,
-                        initial_prompt="これは電話の通話録音です。2人の人間が交互に会話しています。"
+                        initial_prompt="これは複数人が参加している通話録音です。A、B、Cの話者が交互に会話しています。"
                     )
-                    text_result = result.get("text", "").strip()
                     
-                    # 【新機能】結果をファイルに保存する
+                    segments = result.get("segments", [])
+                    timeline_lines = []
+                    
+                    # 💡 話者を A, B, C の3名表記に最適化
+                    speakers = ["A", "B", "C"]
+                    speaker_index = 0
+                    last_end_time = 0.0
+                    
+                    for seg in segments:
+                        start = seg.get("start", 0.0)
+                        end = seg.get("end", 0.0)
+                        text = seg.get("text", "").strip()
+                        
+                        if not text:
+                            continue
+                            
+                        if (start - last_end_time) > 1.0 or last_end_time > 0.0:
+                            speaker_index = (speaker_index + 1) % len(speakers)
+                        
+                        current_speaker = speakers[speaker_index]
+                        
+                        min_str = f"{int(start // 60):02d}"
+                        sec_str = f"{int(start % 60):02d}"
+                        
+                        timeline_lines.append(f"[{min_str}:{sec_str}] {current_speaker}: {text}")
+                        last_end_time = end
+                    
+                    text_result = "\n".join(timeline_lines)
+                    
                     if text_result:
                         with open(txt_save_path, 'w', encoding='utf-8') as f:
                             f.write(text_result)
@@ -265,7 +292,6 @@ class FaxPlayerApp:
                     if optimized_wav != data["full_path"] and os.path.exists(optimized_wav):
                         os.remove(optimized_wav)
             
-            # フォールバック処理
             if not text_result:
                 if "用件" in data["info_text"] or "通話" in data["info_text"]:
                     text_result = f"({data['info_text'].split('[')[0].strip()})"
@@ -282,29 +308,75 @@ class FaxPlayerApp:
         if index < len(children):
             item_id = children[index]
             current_values = self.tree.item(item_id, "values")
-            new_values = (current_values[0], current_values[1], text, current_values[2], current_values[3])
+            preview_text = text.replace('\n', '  ')
+            new_values = (current_values[0], current_values[1], preview_text, current_values[2], current_values[3])
+            
             self.tree.item(item_id, values=new_values)
             
-            # 現在選択されている行が更新されたら全文表示も更新する
+            original_tags = self.tree.item(item_id, "tags")
+            self.tree.item(item_id, tags=(original_tags[0], text))
+
             selected = self.tree.selection()
             if selected and selected[0] == item_id:
                 self.show_full_transcription()
 
     def show_full_transcription(self):
-        """【新機能】リストで選択された行の文字起こし全文を下部のテキストエリアに表示する"""
         selected_item = self.tree.selection()
         if not selected_item:
             return
             
-        # リストの3番目の列（文字起こし結果）を取得
-        values = self.tree.item(selected_item[0], "values")
-        full_text = values[2]
+        tags = self.tree.item(selected_item[0], "tags")
+        if len(tags) > 1:
+            full_text = tags[1]
+        else:
+            values = self.tree.item(selected_item[0], "values")
+            full_text = values[2]
         
-        # 表示を更新
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, full_text)
         self.detail_text.config(state=tk.DISABLED)
+
+    def delete_single_transcription(self):
+        selected_item = self.tree.selection()
+        if not selected_item: return
+        
+        file_path = self.tree.item(selected_item[0], "tags")[0]
+        base_path, _ = os.path.splitext(file_path)
+        txt_save_path = base_path + ".transcription.txt"
+        filename = os.path.basename(file_path)
+        
+        if os.path.exists(txt_save_path):
+            if messagebox.askyesno("確認", f"「{filename}」の文字起こしキャッシュデータを削除しますか？\n(次回このファイルを開いた際に、自動的に再解析が行われます)"):
+                try:
+                    os.remove(txt_save_path)
+                    self.log(f"🗑️ キャッシュ削除完了: {txt_save_path}")
+                    self.refresh_list()
+                except Exception as e:
+                    messagebox.showerror("エラー", f"ファイルの削除に失敗しました:\n{e}")
+        else:
+            messagebox.showinfo("情報", "このファイルにはまだ文字起こしデータが保存されていません。")
+
+    def delete_all_transcriptions(self):
+        folder = self.selected_dir.get()
+        if not folder:
+            messagebox.showwarning("警告", "対象フォルダが選択されていません。")
+            return
+            
+        if messagebox.askyesno("全削除の確認", "現在開いているフォルダ内の【すべての文字起こしデータ】を完全に削除しますか？\nこの操作は取り消せません。"):
+            count = 0
+            for dirpath, _, filenames in os.walk(folder):
+                for f in filenames:
+                    if f.endswith(".transcription.txt"):
+                        full_path = os.path.join(dirpath, f)
+                        try:
+                            os.remove(full_path)
+                            count += 1
+                        except:
+                            pass
+            
+            messagebox.showinfo("完了", f"計 {count} 件の文字起こしデータをクリアしました。再読み込みを行います。")
+            self.refresh_list()
 
     def play_audio(self):
         self.stop_audio()
