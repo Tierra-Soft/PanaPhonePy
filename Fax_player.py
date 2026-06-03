@@ -17,7 +17,7 @@ class FaxPlayerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Panasonic 電話/FAX 再生・高精度対話文字起こし")
-        self.root.geometry("1150x790") # 履歴選択用のコンボボックス追加に伴い、高さを少し広げました
+        self.root.geometry("1150x790")
         
         self.selected_dir = tk.StringVar()
         self.current_process = None
@@ -40,8 +40,7 @@ class FaxPlayerApp:
             last_path = self.history_paths[0]
             self.selected_dir.set(last_path)
             self.folder_combo.set(last_path)
-            # 起動直後に自動スキャンを開始
-            threading.Thread(target=self.load_files_recursive, args=(last_path,), daemon=True).start()
+            self.root.after(200, lambda: threading.Thread(target=self.load_files_recursive, args=(last_path,), daemon=True).start())
 
     def create_widgets(self):
         # 1. フォルダ選択・履歴管理エリア
@@ -50,36 +49,35 @@ class FaxPlayerApp:
         
         ttk.Label(dir_frame, text="対象フォルダ/SDカード:").pack(side=tk.LEFT, padx=5)
         
-        # EntryからCombobox（プルダウン形式）に変更して履歴を選べるようにしました
-        self.folder_combo = ttk.Combobox(dir_frame, textvariable=self.selected_dir, width=55)
+        self.folder_combo = ttk.Combobox(dir_frame, textvariable=self.selected_dir, width=55, state="normal")
         self.folder_combo['values'] = self.history_paths
         self.folder_combo.pack(side=tk.LEFT, padx=5)
         
-        # コンボボックスで過去のパスを選んだときのイベントを設定
         self.folder_combo.bind("<<ComboboxSelected>>", lambda event: self.on_history_selected())
         
         ttk.Button(dir_frame, text=" 参照... ", command=self.browse_folder).pack(side=tk.LEFT, padx=5)
-        
-        # 💡 不要な履歴を削除するボタンを新設
         ttk.Button(dir_frame, text="🗑️ 履歴から削除", command=self.delete_current_history).pack(side=tk.LEFT, padx=5)
         
         # 2. リスト表示
         list_frame = ttk.Frame(self.root, padding=10)
         list_frame.pack(fill=tk.BOTH, expand=True)
         
-        columns = ("filename", "duration", "transcription", "folder", "date_info")
+        columns = ("date_info", "filename", "duration", "transcription", "folder")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings")
+        
+        # 表のタイトル設定
+        self.tree.heading("date_info", text="録音日時 / 関連情報")
         self.tree.heading("filename", text="音声ファイル名 (.WAV)")
         self.tree.heading("duration", text="長さ")
         self.tree.heading("transcription", text="【複数話者タイムライン】文字起こし結果 (一行プレビュー)")
         self.tree.heading("folder", text="場所 (フォルダ)")
-        self.tree.heading("date_info", text="関連情報 / 更新日時")
         
+        # 表の横幅設定
+        self.tree.column("date_info", width=200, anchor=tk.W)
         self.tree.column("filename", width=130, anchor=tk.W)
         self.tree.column("duration", width=60, anchor=tk.CENTER)
-        self.tree.column("transcription", width=480, anchor=tk.W)
-        self.tree.column("folder", width=130, anchor=tk.W)
-        self.tree.column("date_info", width=250, anchor=tk.W)
+        self.tree.column("transcription", width=530, anchor=tk.W)
+        self.tree.column("folder", width=110, anchor=tk.W)
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -135,40 +133,46 @@ class FaxPlayerApp:
         self.status_label = ttk.Label(control_frame, text="SDカードのフォルダを選択してください。")
         self.status_label.pack(side=tk.RIGHT, padx=10)
 
-    # 💡 【新機能】設定ファイルから履歴を読み込むメソッド
+    # 💡 【重要】logメソッドがクラスの独立したメソッドとして確実に認識されるように位置を完全修正
+    def log(self, message):
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        log_line = f"[{now}] {message}\n"
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, log_line)
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    def clear_log(self):
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
     def load_history(self):
         if os.path.exists(HISTORY_FILE):
             try:
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    # 空行を除外してリスト化
                     paths = [line.strip() for line in f.readlines() if line.strip()]
-                    # 重複を除去しつつ順序を維持
                     return list(dict.fromkeys(paths))
             except:
                 pass
         return []
 
-    # 💡 【新機能】新しいパスを履歴の先頭に保存するメソッド
     def save_history(self, new_path):
         if not new_path: return
-        # 既存のリストの先頭に追加し、重複を排除
         if new_path in self.history_paths:
             self.history_paths.remove(new_path)
         self.history_paths.insert(0, new_path)
-        
-        # 上限20件まで保持
         self.history_paths = self.history_paths[:20]
         
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 for path in self.history_paths:
                     f.write(path + "\n")
-            # 画面のプルダウンメニューを更新
             self.folder_combo['values'] = self.history_paths
+            self.folder_combo.set(new_path)
         except Exception as e:
             self.log(f"⚠️ 履歴の保存に失敗: {e}")
 
-    # 💡 【新機能】不要な履歴を1件削除するメソッド
     def delete_current_history(self):
         current_path = self.selected_dir.get()
         if not current_path:
@@ -176,7 +180,7 @@ class FaxPlayerApp:
             return
             
         if current_path in self.history_paths:
-            if messagebox.askyesno("履歴削除の確認", f"以下のパスを履歴リストから削除しますか？\n(実際のフォルダや音声データは削除されません)\n\n{current_path}"):
+            if messagebox.askyesno("履歴削除の確認", f"以下のパスを履歴リストから削除しますか？\n\n{current_path}"):
                 self.history_paths.remove(current_path)
                 try:
                     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -185,10 +189,10 @@ class FaxPlayerApp:
                     self.folder_combo['values'] = self.history_paths
                     self.log(f"🗑️ 履歴から削除しました: {current_path}")
                     
-                    # 画面表示の初期化
                     if self.history_paths:
-                        self.selected_dir.set(self.history_paths[0])
-                        self.folder_combo.set(self.history_paths[0])
+                        next_path = self.history_paths[0]
+                        self.selected_dir.set(next_path)
+                        self.folder_combo.set(next_path)
                         self.refresh_list()
                     else:
                         self.selected_dir.set("")
@@ -198,23 +202,19 @@ class FaxPlayerApp:
                         self.clear_log()
                 except Exception as e:
                     messagebox.showerror("エラー", f"履歴の更新に失敗しました:\n{e}")
-        else:
-            messagebox.showinfo("情報", "選択されたパスは履歴に登録されていません。")
 
     def browse_folder(self):
         folder = filedialog.askdirectory(title="PanasonicのSDカードを選択", initialdir=self.default_init_dir)
         if folder:
             self.selected_dir.set(folder)
             self.folder_combo.set(folder)
-            # 新しいフォルダを履歴に保存
             self.save_history(folder)
             self.refresh_list()
 
-    # 💡 【新機能】プルダウン（コンボボックス）から履歴を選び直したときの処理
     def on_history_selected(self):
-        folder = self.selected_dir.get()
+        folder = self.folder_combo.get()
         if folder:
-            # 選択したパスを一番最新（履歴の先頭）に並び替えて保存
+            self.selected_dir.set(folder)
             self.save_history(folder)
             self.refresh_list()
 
@@ -308,7 +308,7 @@ class FaxPlayerApp:
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + ".transcription.txt")
             initial_status = "📄 保存済みデータを読込中..." if os.path.exists(txt_save_path) else "📄 AI解析待ち..."
             self.root.after(0, lambda d=data, status=initial_status: self.tree.insert(
-                "", tk.END, values=(d["wav"], d["duration"], status, d["rel_folder"], d["info_text"]), tags=(d["full_path"],)
+                "", tk.END, values=(d["info_text"], d["wav"], d["duration"], status, d["rel_folder"]), tags=(d["full_path"],)
             ))
 
         need_ai = any(not os.path.exists(os.path.join(d["dirpath"], d["base_name"] + ".transcription.txt")) for d in all_wav_data if d["seconds"] > 0.5)
@@ -402,7 +402,7 @@ class FaxPlayerApp:
             item_id = children[index]
             current_values = self.tree.item(item_id, "values")
             preview_text = text.replace('\n', '  ')
-            new_values = (current_values[0], current_values[1], preview_text, current_values[2], current_values[3])
+            new_values = (current_values[0], current_values[1], current_values[2], preview_text, current_values[4])
             
             self.tree.item(item_id, values=new_values)
             
@@ -423,7 +423,7 @@ class FaxPlayerApp:
             full_text = tags[1]
         else:
             values = self.tree.item(selected_item[0], "values")
-            full_text = values[2]
+            full_text = values[3]
         
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
