@@ -26,7 +26,9 @@ class FaxPlayerApp:
         self.current_seconds = 0
         self.timer_thread = None
         
-        self.ai_engine_var = tk.StringVar(value="amivoice")
+        # 💡 起動時に前回保存されたAI設定を読み込む（保存が無ければamivoiceがデフォルト）
+        saved_engine = self.load_saved_engine()
+        self.ai_engine_var = tk.StringVar(value=saved_engine)
         self.whisper_model = None
         
         self.default_init_dir = os.path.expanduser("~/Documents")
@@ -135,11 +137,38 @@ class FaxPlayerApp:
         self.log_text.delete("1.0", tk.END)
         self.log_text.config(state=tk.DISABLED)
 
+    def load_saved_engine(self):
+        """💡 履歴ファイルの最終行から前回使ったAI名を安全に引き抜く"""
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    for line in reversed(f.readlines()):
+                        if line.startswith("LAST_ENGINE="):
+                            engine = line.replace("LAST_ENGINE=", "").strip()
+                            if engine in ["amivoice", "whisper"]: return engine
+            except: pass
+        return "amivoice"
+
+    def save_current_engine(self):
+        """💡 現在選択中のAIエンジン設定を履歴ファイルの末尾に上書き・保存する"""
+        engine = self.ai_engine_var.get()
+        lines = []
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    lines = [l for l in f.readlines() if not l.startswith("LAST_ENGINE=")]
+            except: pass
+        lines.append(f"LAST_ENGINE={engine}\n")
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e: self.log(f"⚠️ AI設定の保存に失敗: {e}")
+
     def load_history(self):
         if os.path.exists(HISTORY_FILE):
             try:
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    return list(dict.fromkeys([line.strip() for line in f.readlines() if line.strip()]))
+                    return list(dict.fromkeys([line.strip() for line in f.readlines() if line.strip() and not line.startswith("LAST_ENGINE=")]))
             except: pass
         return []
 
@@ -148,9 +177,13 @@ class FaxPlayerApp:
         if new_path in self.history_paths: self.history_paths.remove(new_path)
         self.history_paths.insert(0, new_path)
         self.history_paths = self.history_paths[:20]
+        
+        # 💡 パス履歴と一緒に、現在のAI設定もまとめて一本化して保存
+        engine = self.ai_engine_var.get()
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 for path in self.history_paths: f.write(path + "\n")
+                f.write(f"LAST_ENGINE={engine}\n")
             self.folder_combo['values'] = self.history_paths
             self.folder_combo.set(new_path)
         except Exception as e: self.log(f"⚠️ 履歴の保存に失敗: {e}")
@@ -160,9 +193,11 @@ class FaxPlayerApp:
         if not current_path or current_path not in self.history_paths: return
         if messagebox.askyesno("履歴削除の確認", f"以下のパスを履歴リストから削除しますか？\n\n{current_path}"):
             self.history_paths.remove(current_path)
+            engine = self.ai_engine_var.get()
             try:
                 with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                     for path in self.history_paths: f.write(path + "\n")
+                    f.write(f"LAST_ENGINE={engine}\n")
                 self.folder_combo['values'] = self.history_paths
                 self.log(f"🗑️ 履歴から削除しました: {current_path}")
                 if self.history_paths:
@@ -195,6 +230,7 @@ class FaxPlayerApp:
     def on_engine_switched(self):
         engine = self.ai_engine_var.get()
         self.log(f"⚙️ 認識AIエンジンを切り替えました ➔ {engine.upper()}")
+        self.save_current_engine() # 💡 切り替えた瞬間に設定を即時ローカル保存
         self.refresh_list()
 
     def refresh_list(self):
@@ -285,7 +321,6 @@ class FaxPlayerApp:
         return []
 
     def format_timeline_lines(self, segments, is_amivoice, total_duration):
-        """💡 共通化：話者A/Bと信号音検知の成形ロジックを一括化"""
         timeline_lines = []
         current_speaker, has_started = "A", False
         
@@ -298,7 +333,6 @@ class FaxPlayerApp:
                 text = seg.get("text", "").strip()
                 
             if not text: continue
-            
             if idx < 2 and start < 4.0 and any(x in text for x in ["つ", "ぷ", "ツ", "プ", "トゥ"]):
                 text, speaker_label = "[発信音 (接続中...)]", "🤖"
             elif (total_duration - start) < 3.5 and any(x in text for x in ["つ", "ぷ", "ツ", "プ"]):
@@ -356,9 +390,7 @@ class FaxPlayerApp:
         for data in all_wav_data:
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + f".transcription.{current_mode}.txt")
             initial_status = "📄 保存済みデータを読込中..." if os.path.exists(txt_save_path) else f"📄 AI（{current_mode.upper()}）の解析待ち..."
-            self.root.after(0, lambda d=data, status=initial_status: self.tree.insert(
-                "", tk.END, values=(d["info_text"], d["wav"], d["duration"], status, d["rel_folder"]), tags=(d["full_path"],)
-            ))
+            self.tree.insert("", tk.END, values=(data["info_text"], data["wav"], data["duration"], initial_status, data["rel_folder"]), tags=(data["full_path"],))
 
         if current_mode == "whisper":
             need_whisper = any(not os.path.exists(os.path.join(d["dirpath"], d["base_name"] + ".transcription.whisper.txt")) for d in all_wav_data if d["seconds"] > 0.5)
