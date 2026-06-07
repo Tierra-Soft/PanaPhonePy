@@ -13,11 +13,22 @@ warnings.filterwarnings("ignore", category=UserWarning)
 HISTORY_FILE = "folder_history.txt"
 AMIVOICE_APPKEY = "B44F01E14C703D5E6CA2C30DE3F2EBA82C20D022DCA64E3C479BFA233CFDD430AF"
 
+ULAW_TO_PCM = []
+for i in range(256):
+    c = ~i
+    sign = -1 if (c & 0x80) else 1
+    exponent = (c >> 4) & 0x07
+    mantissa = c & 0x0F
+    sample = (mantissa << 3) + 132
+    sample <<= exponent
+    sample -= 132
+    ULAW_TO_PCM.append(sign * sample)
+
 class FaxPlayerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Panasonic 電話/FAX 再生・マルチAI文字起こし")
-        self.root.geometry("1150x830")
+        self.root.geometry("1150x850")
         
         self.selected_dir = tk.StringVar()
         self.current_process = None
@@ -25,8 +36,12 @@ class FaxPlayerApp:
         self.total_seconds = 0
         self.current_seconds = 0
         self.timer_thread = None
+        self.playing_file_path = None
         
-        # 💡 起動時に前回保存されたAI設定を読み込む（保存が無ければamivoiceがデフォルト）
+        self.current_peaks = []
+        self.playback_start_time = 0.0
+        self.seek_offset_seconds = 0.0
+        
         saved_engine = self.load_saved_engine()
         self.ai_engine_var = tk.StringVar(value=saved_engine)
         self.whisper_model = None
@@ -85,34 +100,29 @@ class FaxPlayerApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.tree.bind("<Double-1>", lambda event: self.play_audio())
-        self.tree.bind("<<TreeviewSelect>>", lambda event: self.show_full_transcription())
+        self.tree.bind("<<TreeviewSelect>>", lambda event: self.on_file_selected_changed())
         self.tree.bind("<Alt-1>", lambda event: self.delete_single_transcription())
 
         detail_frame = ttk.LabelFrame(self.root, text=" 📝 選択中の文字起こし対話全文（時間・話者ごとのタイムライン表示）", padding=5)
         detail_frame.pack(fill=tk.X, padx=10, pady=5)
         
+        # 💡 ハイライトカラー用のタグ設定（薄い青色：#E6F2FF）
         self.detail_text = tk.Text(detail_frame, height=7, state=tk.DISABLED, bg="#FFFFFF", fg="#000000", font=("Menlo", 12), wrap=tk.WORD)
+        self.detail_text.tag_configure("active_line", background="#E6F2FF", foreground="#000000")
         self.detail_text.pack(fill=tk.X, side=tk.LEFT, expand=True)
         detail_scroll = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=self.detail_text.yview)
         self.detail_text.configure(yscrollcommand=detail_scroll.set)
         detail_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        player_frame = ttk.LabelFrame(self.root, text=" 💡 再生状況 ", padding=10)
+        player_frame = ttk.LabelFrame(self.root, text=" 💡 オーディオタイムライン波形（クリックするとその位置にジャンプして再生します） ", padding=10)
         player_frame.pack(fill=tk.X, padx=10, pady=5)
+        
         self.time_label = ttk.Label(player_frame, text="00:00 / 00:00", font=("Menlo", 12, "bold"))
         self.time_label.pack(side=tk.RIGHT, padx=10)
         
-        self.progress_val = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(player_frame, variable=self.progress_val, maximum=100, mode='determinate')
-        self.progress_bar.pack(fill=tk.X, side=tk.LEFT, expand=True, padx=5)
-
-        log_frame = ttk.LabelFrame(self.root, text=" 処理ログ（解析状況）", padding=5)
-        log_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.log_text = tk.Text(log_frame, height=3, state=tk.DISABLED, bg="#EAEAEA", fg="#000000", font=("Menlo", 11))
-        self.log_text.pack(fill=tk.X, side=tk.LEFT, expand=True)
-        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.wave_canvas = tk.Canvas(player_frame, height=65, bg="#1a1a1a", highlightthickness=0, cursor="hand2")
+        self.wave_canvas.pack(fill=tk.X, side=tk.BOTTOM, pady=(5, 0))
+        self.wave_canvas.bind("<Button-1>", self.on_waveform_clicked)
 
         control_frame = ttk.Frame(self.root, padding=10)
         control_frame.pack(fill=tk.X)
@@ -125,20 +135,10 @@ class FaxPlayerApp:
         self.status_label = ttk.Label(control_frame, text="SDカードのフォルダを選択してください。")
         self.status_label.pack(side=tk.RIGHT, padx=10)
 
-    def log(self, message):
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"[{now}] {message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-
-    def clear_log(self):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.delete("1.0", tk.END)
-        self.log_text.config(state=tk.DISABLED)
+    def log(self, message): self.status_label.config(text=message)
+    def clear_log(self): pass
 
     def load_saved_engine(self):
-        """💡 履歴ファイルの最終行から前回使ったAI名を安全に引き抜く"""
         if os.path.exists(HISTORY_FILE):
             try:
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -150,7 +150,6 @@ class FaxPlayerApp:
         return "amivoice"
 
     def save_current_engine(self):
-        """💡 現在選択中のAIエンジン設定を履歴ファイルの末尾に上書き・保存する"""
         engine = self.ai_engine_var.get()
         lines = []
         if os.path.exists(HISTORY_FILE):
@@ -160,9 +159,8 @@ class FaxPlayerApp:
             except: pass
         lines.append(f"LAST_ENGINE={engine}\n")
         try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-        except Exception as e: self.log(f"⚠️ AI設定の保存に失敗: {e}")
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f: f.writelines(lines)
+        except: pass
 
     def load_history(self):
         if os.path.exists(HISTORY_FILE):
@@ -177,8 +175,6 @@ class FaxPlayerApp:
         if new_path in self.history_paths: self.history_paths.remove(new_path)
         self.history_paths.insert(0, new_path)
         self.history_paths = self.history_paths[:20]
-        
-        # 💡 パス履歴と一緒に、現在のAI設定もまとめて一本化して保存
         engine = self.ai_engine_var.get()
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
@@ -186,7 +182,7 @@ class FaxPlayerApp:
                 f.write(f"LAST_ENGINE={engine}\n")
             self.folder_combo['values'] = self.history_paths
             self.folder_combo.set(new_path)
-        except Exception as e: self.log(f"⚠️ 履歴の保存に失敗: {e}")
+        except: pass
 
     def delete_current_history(self):
         current_path = self.selected_dir.get()
@@ -199,7 +195,6 @@ class FaxPlayerApp:
                     for path in self.history_paths: f.write(path + "\n")
                     f.write(f"LAST_ENGINE={engine}\n")
                 self.folder_combo['values'] = self.history_paths
-                self.log(f"🗑️ 履歴から削除しました: {current_path}")
                 if self.history_paths:
                     next_path = self.history_paths[0]
                     self.selected_dir.set(next_path)
@@ -209,7 +204,6 @@ class FaxPlayerApp:
                     self.selected_dir.set("")
                     self.folder_combo.set("")
                     for item in self.tree.get_children(): self.tree.delete(item)
-                    self.clear_log()
             except Exception as e: messagebox.showerror("エラー", f"履歴更新失敗:\n{e}")
 
     def browse_folder(self):
@@ -228,9 +222,7 @@ class FaxPlayerApp:
             self.refresh_list()
 
     def on_engine_switched(self):
-        engine = self.ai_engine_var.get()
-        self.log(f"⚙️ 認識AIエンジンを切り替えました ➔ {engine.upper()}")
-        self.save_current_engine() # 💡 切り替えた瞬間に設定を即時ローカル保存
+        self.save_current_engine()
         self.refresh_list()
 
     def refresh_list(self):
@@ -238,7 +230,6 @@ class FaxPlayerApp:
         if not folder: return
         for item in self.tree.get_children(): self.tree.delete(item)
         self.stop_audio()
-        self.clear_log()
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.config(state=tk.DISABLED)
@@ -288,8 +279,7 @@ class FaxPlayerApp:
             'u': AMIVOICE_APPKEY
         }
         try:
-            with open(audio_path, 'rb') as f:
-                audio_binary = f.read()
+            with open(audio_path, 'rb') as f: audio_binary = f.read()
             files = {'a': ('audio.wav', audio_binary, 'audio/wav')}
             response = requests.post(url, data=payload, files=files, timeout=90)
             if response.status_code == 200:
@@ -300,10 +290,8 @@ class FaxPlayerApp:
                     if isinstance(res_node, list):
                         for r in res_node:
                             if "tokens" in r: extracted_tokens.extend(r["tokens"])
-                    elif isinstance(res_node, dict) and "tokens" in res_node:
-                        extracted_tokens = res_node["tokens"]
-                elif "tokens" in data:
-                    extracted_tokens = data["tokens"]
+                    elif isinstance(res_node, dict) and "tokens" in res_node: extracted_tokens = res_node["tokens"]
+                elif "tokens" in data: extracted_tokens = data["tokens"]
                 if extracted_tokens: return extracted_tokens
                 
                 raw_text = data.get("text", "")
@@ -314,16 +302,12 @@ class FaxPlayerApp:
                 if raw_text:
                     sentences = re.split(r'[。、\s\n]+', raw_text)
                     return [{"starttime": idx * 3000, "written": s.strip()} for idx, s in enumerate(sentences) if s.strip()]
-            else:
-                self.root.after(0, lambda: self.log(f"❌ AmiVoiceサーバー応答エラー (Status: {response.status_code})"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"❌ AmiVoice通信失敗: {str(e)}"))
+        except: pass
         return []
 
     def format_timeline_lines(self, segments, is_amivoice, total_duration):
         timeline_lines = []
         current_speaker, has_started = "A", False
-        
         for idx, seg in enumerate(segments):
             if is_amivoice:
                 start = float(seg.get("starttime", 0)) / 1000.0
@@ -331,27 +315,21 @@ class FaxPlayerApp:
             else:
                 start = seg.get("start", 0.0)
                 text = seg.get("text", "").strip()
-                
             if not text: continue
-            if idx < 2 and start < 4.0 and any(x in text for x in ["つ", "ぷ", "ツ", "プ", "トゥ"]):
-                text, speaker_label = "[発信音 (接続中...)]", "🤖"
-            elif (total_duration - start) < 3.5 and any(x in text for x in ["つ", "ぷ", "ツ", "プ"]):
-                text, speaker_label = "[話中音 (通話切断)]", "🤖"
+            if idx < 2 and start < 4.0 and any(x in text for x in ["つ", "ぷ", "ツ", "プ", "トゥ"]): text, speaker_label = "[発信音 (接続中...)]", "🤖"
+            elif (total_duration - start) < 3.5 and any(x in text for x in ["つ", "ぷ", "ツ", "プ"]): text, speaker_label = "[話中音 (通話切断)]", "🤖"
             else:
                 text = self.clean_japanese_text(text)
                 if not text: continue
                 if not has_started: current_speaker, has_started = "A", True
                 else: current_speaker = "B" if current_speaker == "A" else "A"
                 speaker_label = current_speaker
-                
             timeline_lines.append(f"[{f'{int(start // 60):02d}:{int(start % 60):02d}'}] {speaker_label}: {text}")
         return "\n".join(timeline_lines)
 
     def load_files_recursive(self, root_folder_path):
         if not os.path.exists(root_folder_path): return
         current_mode = self.ai_engine_var.get()
-        self.root.after(0, lambda: self.log(f"検索開始（モード: {current_mode.upper()}）: {root_folder_path}"))
-        
         weeks = ["月", "火", "水", "木", "金", "土", "日"]
         all_wav_data = []
         for dirpath, dirnames, filenames in os.walk(root_folder_path):
@@ -371,8 +349,7 @@ class FaxPlayerApp:
                 info_text = ""
                 if os.path.exists(txt_path):
                     try:
-                        with open(txt_path, 'r', encoding='cp932', errors='ignore') as f:
-                            info_text = f.read().replace('\n', ' ').strip()
+                        with open(txt_path, 'r', encoding='cp932', errors='ignore') as f: info_text = f.read().replace('\n', ' ').strip()
                     except: pass
                 info_text = f"{info_text} [{mtime_str}]" if info_text else f"日時: {mtime_str}"
                 
@@ -382,10 +359,7 @@ class FaxPlayerApp:
                     "dirpath": dirpath, "base_name": base_name
                 })
         
-        if not all_wav_data:
-            self.root.after(0, lambda: self.log("対象ファイルが見つかりませんでした。"))
-            return
-            
+        if not all_wav_data: return
         all_wav_data.sort(key=lambda x: x["mtime"], reverse=True)
         for data in all_wav_data:
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + f".transcription.{current_mode}.txt")
@@ -395,17 +369,9 @@ class FaxPlayerApp:
         if current_mode == "whisper":
             need_whisper = any(not os.path.exists(os.path.join(d["dirpath"], d["base_name"] + ".transcription.whisper.txt")) for d in all_wav_data if d["seconds"] > 0.5)
             if need_whisper and self.whisper_model is None:
-                try:
-                    import whisper
-                    self.root.after(0, lambda: self.log("🚀 音声認識モデル(Whisper-turbo)をローカル起動中..."))
-                    self.status_label.config(text="ローカルAIエンジン起動中...")
-                    self.whisper_model = whisper.load_model("turbo")
-                    self.root.after(0, lambda: self.log("ローカルAIエンジンのロードが完了しました！"))
-                except Exception as e:
-                    self.root.after(0, lambda err=e: self.log(f"❌ Whisper起動失敗: {err}"))
-                    return
+                try: import whisper; self.whisper_model = whisper.load_model("turbo")
+                except: return
 
-        self.status_label.config(text=f"{current_mode.upper()}で文字起こし中...")
         for index, data in enumerate(all_wav_data):
             txt_save_path = os.path.join(data["dirpath"], data["base_name"] + f".transcription.{current_mode}.txt")
             text_result = ""
@@ -416,31 +382,24 @@ class FaxPlayerApp:
             
             if not text_result and data["seconds"] > 0.5:
                 if current_mode == "amivoice":
-                    self.root.after(0, lambda idx=index: self.log(f"[{idx + 1}/{len(all_wav_data)}] AmiVoice超高速クラウド解析中: {data['wav']}"))
                     try:
                         tokens = self.request_amivoice_transcribe(data["full_path"])
                         text_result = self.format_timeline_lines(tokens, True, data["seconds"])
-                    except Exception as e: text_result = f"(AmiVoiceエラー: {str(e)})"
+                    except: pass
                 elif current_mode == "whisper" and self.whisper_model:
-                    self.root.after(0, lambda idx=index: self.log(f"[{idx + 1}/{len(all_wav_data)}] WhisperローカルPC解析中: {data['wav']}"))
                     optimized_wav = self.preprocess_phone_audio_via_ffmpeg(data["full_path"])
                     try:
                         result = self.whisper_model.transcribe(optimized_wav, language="ja", fp16=False, initial_prompt="これは2人の電話録音です。")
                         text_result = self.format_timeline_lines(result.get("segments", []), False, data["seconds"])
-                    except Exception as e: text_result = f"(Whisperエラー: {str(e)})"
+                    except: pass
                     finally:
                         if optimized_wav != data["full_path"] and os.path.exists(optimized_wav): os.remove(optimized_wav)
-                
                 if text_result:
                     with open(txt_save_path, 'w', encoding='utf-8') as f: f.write(text_result)
-
             if not text_result:
                 if "用件" in data["info_text"] or "通話" in data["info_text"]: text_result = f"({data['info_text'].split('[')[0].strip()})"
                 else: text_result = "（通話内容なし）"
             self.root.after(0, lambda idx=index, txt=text_result: self.update_tree_item(idx, txt))
-
-        self.root.after(0, lambda: self.log(f"すべてのデータの {current_mode.upper()} 読み込みが完了しました！"))
-        self.status_label.config(text="読み込み完了")
 
     def update_tree_item(self, index, text):
         children = self.tree.get_children()
@@ -453,14 +412,148 @@ class FaxPlayerApp:
             selected = self.tree.selection()
             if selected and selected[0] == item_id: self.show_full_transcription()
 
+    def on_file_selected_changed(self):
+        self.show_full_transcription()
+        selected_item = self.tree.selection()
+        if not selected_item: return
+        tags = self.tree.item(selected_item[0], "tags")
+        if not tags or not tags[0]: return
+        
+        file_path = tags[0]
+        if not self.is_playing:
+            self.seek_offset_seconds = 0.0
+        threading.Thread(target=self.generate_and_cache_waveform, args=(file_path,), daemon=True).start()
+
+    def generate_and_cache_waveform(self, file_path):
+        if not os.path.exists(file_path): return
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(0, 2)
+                total_bytes = f.tell()
+                data_start_offset = 44
+                if total_bytes <= data_start_offset: return
+                f.seek(data_start_offset)
+                raw_samples = f.read()
+                
+            total_samples = len(raw_samples)
+            self.root.update_idletasks()
+            canvas_width = max(self.wave_canvas.winfo_width(), 100)
+            step = max(total_samples // canvas_width, 1)
+            
+            peaks = []
+            for i in range(0, total_samples, step):
+                chunk = raw_samples[i:i+step]
+                if not chunk: break
+                max_v = 0
+                for b in chunk:
+                    v = abs(ULAW_TO_PCM[b])
+                    if v > max_v: max_v = v
+                peaks.append(max_v)
+                
+            self.current_peaks = peaks
+            init_pct = (self.seek_offset_seconds / self.total_seconds * 100.0) if self.total_seconds > 0 else 0.0
+            self.root.after(0, lambda: self.redraw_waveform_timeline(init_pct))
+        except: pass
+
+    def redraw_waveform_timeline(self, progress_percent):
+        self.wave_canvas.delete("all")
+        canvas_width = max(self.wave_canvas.winfo_width(), 100)
+        canvas_height = 65
+        mid_y = canvas_height // 2
+        
+        for x, max_amp in enumerate(self.current_peaks):
+            if x >= canvas_width: break
+            pct = max_amp / 32635.0
+            line_h = max(int(pct * (canvas_height - 10)), 2)
+            y1 = mid_y - (line_h // 2)
+            y2 = mid_y + (line_h // 2)
+            
+            current_x_percent = (x / canvas_width) * 100.0
+            if current_x_percent <= progress_percent:
+                color = "#00d2ff" if (y2 - y1) > 2 else "#226677"
+            else:
+                color = "#39FF14" if (y2 - y1) > 2 else "#334433"
+                
+            self.wave_canvas.create_line(x, y1, x, y2, fill=color)
+            
+        cursor_x = int((progress_percent / 100.0) * canvas_width)
+        self.wave_canvas.create_line(cursor_x, 0, cursor_x, canvas_height, fill="#ff3333", width=2)
+        self.wave_canvas.create_oval(cursor_x-4, mid_y-4, cursor_x+4, mid_y+4, fill="#ff3333", outline="#ffffff")
+
+    def on_waveform_clicked(self, event):
+        if not self.current_peaks: return
+        canvas_width = max(self.wave_canvas.winfo_width(), 100)
+        click_x = event.x
+        click_percent = min(max((click_x / canvas_width) * 100.0, 0.0), 100.0)
+        
+        selected_item = self.tree.selection()
+        if not selected_item: return
+        tags = self.tree.item(selected_item[0], "tags")
+        if not tags or not tags[0]: return
+        file_path = tags[0]
+        
+        duration, _ = self.get_audio_info(file_path)
+        if duration == 0: return
+        self.total_seconds = duration
+        
+        target_seconds = (click_percent / 100.0) * duration
+        self.seek_offset_seconds = target_seconds
+        
+        cur_time_str = f"{int(target_seconds // 60):02d}:{int(target_seconds % 60):02d}"
+        total_time_str = f"{int(duration // 60):02d}:{int(duration % 60):02d}"
+        self.update_player_timeline_ui(click_percent, f"{cur_time_str} / {total_time_str}")
+        
+        if self.is_playing:
+            self.play_audio_from_seconds(file_path, target_seconds)
+
     def show_full_transcription(self):
+        """💡 テキスト全文をエリアに流し込む（自動追跡スクロールのために現在表示中の状態を初期化）"""
         selected_item = self.tree.selection()
         if not selected_item: return
         tags = self.tree.item(selected_item[0], "tags")
         full_text = tags[1] if len(tags) > 1 else self.tree.item(selected_item[0], "values")[3]
+        
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
         self.detail_text.insert(tk.END, full_text)
+        self.detail_text.config(state=tk.DISABLED)
+        # 選択変更時はスクロール追跡をリセット
+        self.sync_text_scroll_to_time(0.0)
+
+    def sync_text_scroll_to_time(self, elapsed_seconds):
+        """💡 【本日の主役】現在の再生秒数に一致するタイムコードをテキスト内から全検索し、スクロール＆ハイライトする"""
+        self.detail_text.config(state=tk.NORMAL)
+        # 過去の古いハイライトタグを一旦すべてクリア
+        self.detail_text.tag_remove("active_line", "1.0", tk.END)
+        
+        # テキスト全体の行数を取得
+        total_lines = int(self.detail_text.index('end-1c').split('.')[0])
+        best_match_line = None
+        closest_diff = 9999.0
+        
+        # 1行ずつ解析し、行頭の [分:秒] のスタンプを抽出して現在の再生時間と比較
+        for line_num in range(1, total_lines + 1):
+            line_content = self.detail_text.get(f"{line_num}.0", f"{line_num}.end")
+            match = re.match(r"^\[(\d+):(\d+)\]", line_content)
+            if match:
+                st_min = int(match.group(1))
+                st_sec = int(match.group(2))
+                timestamp_seconds = (st_min * 60) + st_sec
+                
+                # 再生時間をすでに通過している（かつ最も現在時刻に近い）発言行を探す
+                if timestamp_seconds <= elapsed_seconds:
+                    diff = elapsed_seconds - timestamp_seconds
+                    if diff < closest_diff:
+                        closest_diff = diff
+                        best_match_line = line_num
+
+        # 💡 現在再生中の発言行が見つかった場合、そこへジャンプ
+        if best_match_line is not None:
+            # 対象行の背景を薄い青色（active_lineタグ）にする
+            self.detail_text.tag_add("active_line", f"{best_match_line}.0", f"{best_match_line}.end")
+            # 画面中央付近にくるように滑らかに見える位置へ自動スクロール
+            self.detail_text.see(f"{best_match_line}.0")
+            
         self.detail_text.config(state=tk.DISABLED)
 
     def retranscribe_selected_file(self):
@@ -474,8 +567,7 @@ class FaxPlayerApp:
         txt_save_path = base_path + f".transcription.{current_mode}.txt"
         if os.path.exists(txt_save_path):
             try: os.remove(txt_save_path)
-            except Exception as e: self.log(f"❌ キャッシュ削除失敗: {e}")
-        self.log(f"🔄 選択ファイルを再認識します ({current_mode.upper()}): {os.path.basename(file_path)}")
+            except: pass
         self.refresh_list()
 
     def delete_single_transcription(self):
@@ -502,43 +594,65 @@ class FaxPlayerApp:
         self.refresh_list()
 
     def play_audio(self):
-        self.stop_audio()
         selected_item = self.tree.selection()
         if not selected_item: return
         tags = self.tree.item(selected_item[0], "tags")
         if not tags or not tags[0]: return
-        file_path = tags[0]
-        self.total_seconds, duration_str = self.get_audio_info(file_path)
+        self.play_audio_from_seconds(tags[0], self.seek_offset_seconds)
+
+    def play_audio_from_seconds(self, file_path, start_seconds):
+        self.is_playing = False
+        if self.current_process:
+            self.current_process.terminate()
+            self.current_process = None
+            
+        self.playing_file_path = file_path
+        self.total_seconds, duration_str = self.get_audio_info(self.playing_file_path)
         if self.total_seconds == 0: self.total_seconds = 1
+        
         try:
-            self.current_process = subprocess.Popen(["afplay", file_path])
+            cmd = ["ffplay", "-nodisp", "-autoexit", "-ss", str(round(start_seconds, 2)), self.playing_file_path]
+            self.current_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.is_playing = True
-            self.current_seconds = 0
-            self.timer_thread = threading.Thread(target=self.track_playback_progress, args=(duration_str,), daemon=True)
+            
+            self.playback_start_time = time.time()
+            self.seek_offset_seconds = start_seconds
+            
+            self.timer_thread = threading.Thread(target=self.track_playback_progress_with_waveform, args=(duration_str,), daemon=True)
             self.timer_thread.start()
         except: pass
 
-    def track_playback_progress(self, duration_str):
+    def track_playback_progress_with_waveform(self, duration_str):
         while self.is_playing and self.current_process:
-            if self.current_process.poll() is not None or self.current_seconds >= self.total_seconds: break
-            percent = (self.current_seconds / self.total_seconds) * 100
-            cur_time_str = f"{int(self.current_seconds // 60):02d}:{int(self.current_seconds % 60):02d}"
-            self.root.after(0, lambda p=percent, text=f"{cur_time_str} / {duration_str}": self.update_player_ui(p, text))
-            time.sleep(1)
-            self.current_seconds += 1
-        self.root.after(0, lambda: self.update_player_ui(100 if self.is_playing else 0, f"{duration_str} / {duration_str}" if self.is_playing else "00:00 / 00:00"))
+            if self.current_process.poll() is not None: break
+            elapsed = (time.time() - self.playback_start_time) + self.seek_offset_seconds
+            if elapsed >= self.total_seconds: break
+            
+            percent = (elapsed / self.total_seconds) * 100.0
+            cur_time_str = f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+            
+            self.root.after(0, lambda p=percent, t=f"{cur_time_str} / {duration_str}", e=elapsed: self.update_player_timeline_ui(p, t, e))
+            time.sleep(0.1)
+            
+        if not self.is_playing: return
+        self.root.after(0, lambda: self.update_player_timeline_ui(100.0, f"{duration_str} / {duration_str}", self.total_seconds))
         self.is_playing = False
+        self.seek_offset_seconds = 0.0
 
-    def update_player_ui(self, percent, time_text):
-        self.progress_val.set(percent)
+    def update_player_timeline_ui(self, percent, time_text, elapsed_seconds):
+        """💡 時間の文字列、波形描画に加えて、テキストエリアの自動スクロールを同期して呼び出す"""
         self.time_label.config(text=time_text)
+        self.redraw_waveform_timeline(percent)
+        # 💡 再生時間の経過に合わせて文字のスクロール位置を同期！
+        self.sync_text_scroll_to_time(elapsed_seconds)
 
     def stop_audio(self):
         self.is_playing = False
         if self.current_process: 
             self.current_process.terminate()
             self.current_process = None
-        self.update_player_ui(0, "00:00 / 00:00")
+        self.seek_offset_seconds = 0.0
+        self.update_player_timeline_ui(0.0, "00:00 / 00:00", 0.0)
 
 if __name__ == "__main__":
     root = tk.Tk()
